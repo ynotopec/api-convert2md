@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pandas
+tabulate
+requests
+
+# PDF tables (recommandé)
+camelot-py[cv]
+pdfplumber
+opencv-python
