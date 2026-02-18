@@ -313,3 +313,13 @@ Focus areas:
 ---
 
 ```
+---
+
+# 🗺️ Project State Artifacts
+
+A current project state file is available in `STATE.md`, including:
+
+- Router / decision flow for the `/process` ingestion path
+- A single critical end-to-end sequence test case
+
+
