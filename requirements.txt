@@ -2,7 +2,7 @@ fastapi
 uvicorn[standard]
 pandas
 tabulate
-requests
+pypdf
 
 # PDF tables (recommandé)
 camelot-py[cv]
