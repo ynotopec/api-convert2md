@@ -1,6 +1,6 @@
 # Project State
 
-This state file captures the ingestion engine control flow and one critical end-to-end test sequence.
+This state file captures the ingestion engine control flow and one critical end-to-end test sequence, aligned with `app.py`.
 
 ## A) Router / Decision Flow
 
@@ -10,29 +10,32 @@ flowchart TD
     B -- No --> B1[Return 401 Missing Bearer token]
     B -- Yes --> C{Bearer token matches ENGINE_API_KEY?}
     C -- No --> C1[Return 403 Invalid token]
-    C -- Yes --> D[Persist request body as temp PDF]
+    C -- Yes --> D{PDF by mime or filename?}
 
-    D --> E[Extract tables via Camelot lattice]
-    E --> F{Any valid tables?}
-    F -- No --> G[Try Camelot stream]
-    F -- Yes --> H[Normalize + rebuild headers + de-duplicate]
+    D -- Yes --> E[Persist request body as temp PDF]
+    E --> F[Extract tables via Camelot lattice]
+    F --> G[Try Camelot stream]
+    G --> H[Try pdfplumber table extraction]
+    H --> I[Normalize + rebuild headers + de-duplicate]
 
-    G --> I{Any valid tables?}
-    I -- No --> J[Try pdfplumber table extraction]
-    I -- Yes --> H
+    I --> J{Any valid table found?}
+    J -- Yes --> K[Emit row-level docs + table markdown snapshot]
+    K --> L[Chunk oversized docs with overlap]
+    L --> M[Return OpenWebUI-compatible JSON payload]
 
-    J --> K{Any valid tables?}
-    K -- Yes --> H
-    K -- No --> L[Fallback to pypdf text extraction]
+    J -- No --> N[Fallback to pypdf text extraction]
+    N --> O{Fallback text empty?}
+    O -- No --> P[Chunk extracted text]
+    O -- Yes --> Q[Create explicit OCR-needed message]
+    P --> M
+    Q --> M
 
-    H --> M[Emit row-level docs when first column is entity-like]
-    M --> N[Also emit markdown snapshot docs]
-    N --> O[Chunk docs with overlap limits]
-    O --> P[Return OpenWebUI-compatible JSON payload]
-
-    L --> Q{Fallback text available?}
-    Q -- No --> Q1[Return empty documents payload]
-    Q -- Yes --> O
+    D -- No --> R[Decode utf-8 best effort]
+    R --> S{Decoded text empty?}
+    S -- Yes --> T[Create non-PDF fallback message]
+    S -- No --> U[Chunk decoded text]
+    T --> M
+    U --> M
 ```
 
 ## B) Single Sequence for a Critical Test Case
@@ -69,11 +72,6 @@ sequenceDiagram
 
     API-->>Client: 200 OK + JSON documents for indexing
 ```
-
-## Notes
-
-- The extraction strategy is intentionally **ordered** to prioritize structure quality before fallback text parsing.
-- The critical case above validates the main reliability promise of the service: preserving table semantics even when one parser mode fails.
 
 ## C) Innovation Pipeline Traceability (Exploration → Service)
 
