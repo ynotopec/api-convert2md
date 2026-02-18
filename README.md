@@ -120,3 +120,5 @@ services:
 - Variables de chunking : `MAX_DOC_CHARS`, `OVERLAP_CHARS`
 - Limite fallback texte : `MAX_TEXT_PAGES`
 - Tuning extraction : `CAMELOT_LATTICE_LINE_SCALE`, `CAMELOT_STREAM_EDGE_TOL`, `CAMELOT_STREAM_ROW_TOL`
+- Performance : `PARALLEL_CAMELOT=1` (défaut, exécution parallèle lattice+stream)
+- Fallback lent optionnel : `RUN_PDFPLUMBER_IF_CAMELOT_FOUND=0` (défaut, n’exécute pdfplumber que si Camelot ne trouve rien)
