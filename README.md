@@ -81,6 +81,7 @@ curl -X PUT "http://localhost:8088/process" \
 - Architecture: `docs/architecture.md`
 - Cas d’usage: `USE_CASE.md`
 - Valeur métier: `VALUE.md`
+- Pitch métier (prêt à présenter): `PITCH_METIER.md`
 - Statut d’innovation: `INNOVATION_STATUS.md`
 
 ## API
