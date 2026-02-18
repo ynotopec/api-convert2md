@@ -69,7 +69,10 @@ warnings.filterwarnings(
 # -----------------------------
 # Config (env)
 # -----------------------------
-ENGINE_API_KEY = os.getenv("ENGINE_API_KEY", "")
+ENGINE_API_KEY = os.getenv("ENGINE_API_KEY")
+if not ENGINE_API_KEY:
+    raise RuntimeError("ENGINE_API_KEY must be set and non-empty")
+
 PDF_PAGES = os.getenv("PDF_PAGES", "all")  # "all" or "1-5" etc.
 
 # Chunking / emission
@@ -94,8 +97,6 @@ MIN_COLS_FOR_TABLE = int(os.getenv("MIN_COLS_FOR_TABLE", "2"))
 # Auth
 # -----------------------------
 def require_bearer(auth_header: Optional[str]) -> None:
-    if not ENGINE_API_KEY:
-        raise HTTPException(500, "ENGINE_API_KEY is not set on the ingestion engine")
     if not auth_header or not auth_header.lower().startswith("bearer "):
         raise HTTPException(401, "Missing Bearer token")
     token = auth_header.split(" ", 1)[1].strip()
