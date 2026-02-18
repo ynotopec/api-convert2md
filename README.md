@@ -91,6 +91,30 @@ curl -X PUT "http://localhost:8088/process" \
 
 Authentification: header `Authorization: Bearer <ENGINE_API_KEY>`.
 
+## Configuration OpenWebUI
+
+### Option A — via variables d’environnement (Docker Compose)
+
+Dans le service `open-webui`, ajoutez les variables suivantes :
+
+```yaml
+services:
+  open-webui:
+    environment:
+      - CONTENT_EXTRACTION_ENGINE=external
+      - EXTERNAL_DOCUMENT_LOADER_URL=http://ingestion-engine:8088
+      - EXTERNAL_DOCUMENT_LOADER_API_KEY=supersecret
+```
+
+### Option B — via l’interface OpenWebUI (UI)
+
+1. Ouvrir **Admin Panel**.
+2. Aller dans **Settings** → **Documents** (ou **Files / Document Processing** selon la version).
+3. Choisir **Content Extraction Engine** = `external`.
+4. Renseigner **External Document Loader URL** = `http://ingestion-engine:8088`.
+5. Renseigner **External Document Loader API Key** = `supersecret`.
+6. Sauvegarder, puis tester l’import d’un PDF.
+
 ## Notes d’exploitation
 
 - Variables de chunking : `MAX_DOC_CHARS`, `OVERLAP_CHARS`
