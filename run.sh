@@ -1,48 +1,34 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-serverAddress=$1
-portNumber=$2
+server_address="${1:-0.0.0.0}"
+port_number="${2:-8088}"
+python_version="${PYTHON_BIN:-python3}"
 
-pythonVersion=python3.11
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
 
-DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-pythonDir=~/"venv/$(basename "${DIR}")"
-cd $DIR
-
-deactivate 2>/dev/null
-mkdir -p "${pythonDir}"
-${pythonVersion} -m venv "${pythonDir}"
-source "${pythonDir}"/bin/activate
-
-#intall
-${pythonVersion} -m pip cache purge ; ${pythonVersion} -m pip install -U pip setuptools wheel ; ${pythonVersion} -m pip install -U -r requirements.txt
-#optimize space
-#(jdupes -X size+:99M -r -L ~ >/dev/null 2>&1 )&
-
-export HF_HUB_DISABLE_TELEMETRY=1
-if [ ! -z "${serverAddress}" ] ;then
-  export GRADIO_SERVER_NAME="${serverAddress}"
-  export SERVER_NAME="${serverAddress}"
+venv_dir="${VENV_DIR:-$DIR/.venv}"
+if [ ! -d "$venv_dir" ]; then
+  "$python_version" -m venv "$venv_dir"
 fi
-if [ ! -z "${portNumber}" ] ;then
-  export GRADIO_SERVER_PORT="${portNumber}"
-  export SERVER_PORT="${portNumber}"
-  export BACK_PORT=$((SERVER_PORT + 1))
-fi
-#export CUDA_LAUNCH_BLOCKING=1
+# shellcheck disable=SC1091
+source "$venv_dir/bin/activate"
 
-# Charger les variables d'environnement depuis .env
+"$python_version" -m pip install -U pip setuptools wheel
+"$python_version" -m pip install -r requirements.txt
+
+# Load optional local environment file.
 if [ -f ".env" ]; then
-#  export $(grep -v '^#' .env | xargs)
   set -a
+  # shellcheck disable=SC1091
   source .env
   set +a
-else
-  echo ".env file not found!"
+fi
+
+if [ -z "${ENGINE_API_KEY:-}" ]; then
+  echo "ENGINE_API_KEY is required (set it in environment or .env)"
   exit 1
 fi
 
-#${pythonVersion} app.py $([ ! -z "${serverAddress}" ] && echo --host ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --port ${portNumber})
-#${pythonVersion} -m streamlit run app.py --browser.gatherUsageStats false $([ ! -z "${serverAddress}" ] && echo --server.address ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --server.port ${portNumber})
-${pythonVersion} -m uvicorn app:app --reload $([ ! -z "${serverAddress}" ] && echo --host ${serverAddress}) $([ ! -z "${portNumber}" ] && echo --port ${portNumber})
-#${pythonVersion} back.py
+exec "$python_version" -m uvicorn app:app --host "$server_address" --port "$port_number"
