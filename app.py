@@ -123,8 +123,8 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
         df[c] = df[c].map(_strip_cell)
 
-    # drop empty rows (vectorized)
-    mask_nonempty = df.ne("").any(axis=1)
+    # drop empty rows
+    mask_nonempty = df.apply(lambda row: any(v != "" for v in row.values), axis=1)
     df = df.loc[mask_nonempty].reset_index(drop=True)
 
     # dedupe column names
@@ -183,8 +183,7 @@ def rebuild_multi_header(df: pd.DataFrame, max_header_rows: int = 4) -> pd.DataF
         return df
 
     header_df = df.iloc[header_rows].fillna("").astype(str)
-    for col in header_df.columns:
-        header_df[col] = header_df[col].map(_strip_cell)
+    header_df = header_df.applymap(_strip_cell) if hasattr(header_df, "applymap") else header_df  # safe, optional
 
     # forward fill horizontally to propagate group headings
     header_df = header_df.replace("", pd.NA).ffill(axis=1).fillna("")
@@ -431,9 +430,6 @@ def table_to_documents(
     return docs
 
 def chunk_text(text: str, max_chars: int, overlap: int) -> List[str]:
-    if max_chars <= 0:
-        raise ValueError("max_chars must be > 0")
-    overlap = min(max(overlap, 0), max_chars - 1)
     if len(text) <= max_chars:
         return [text]
     out = []
