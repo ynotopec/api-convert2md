@@ -1,120 +1,54 @@
-# OpenWebUI Generic External Ingestion Engine
+# API Convert2MD – OpenWebUI External Ingestion Engine
 
-Generic, production-ready **External Content Extraction Engine** for OpenWebUI.
+Service FastAPI prêt à l’emploi pour brancher OpenWebUI sur un moteur d’extraction PDF orienté tableaux.
 
-This service replaces the default internal PDF parsing with a **robust, structure-aware ingestion pipeline** designed for complex tables (tariffs, matrices, multi-level headers, telecom grids, etc.).
+## Objectif
 
-It prevents common RAG hallucinations caused by:
+Convertir des PDFs complexes (grilles tarifaires, matrices, tableaux multi-entêtes) en documents structurés adaptés au RAG, avec une stratégie de fallback robuste.
 
-- Lost table headers
-- Flattened DataFrames
-- Mixed tables in the same chunk
-- Numeric columns without semantic labels
+## Fonctionnalités clés
 
----
+- Extraction de tableaux : Camelot `lattice` → Camelot `stream` → `pdfplumber`
+- Reconstruction automatique des entêtes multi-lignes
+- Déduplication des tableaux via hash stable
+- Emission de documents par ligne + snapshot markdown de tableau
+- Fallback texte PDF via `pypdf`
+- Endpoint compatible OpenWebUI `PUT /process`
 
-# ✨ Features
+## Démarrage rapide (≤ 10 minutes)
 
-- ✅ Camelot (lattice → stream) + pdfplumber fallback
-- ✅ Automatic multi-row header reconstruction (generic)
-- ✅ Table de-duplication via stable `hash_df`
-- ✅ Row-level document emission (best RAG precision)
-- ✅ Markdown snapshot fallback per table
-- ✅ Automatic chunking with overlap
-- ✅ PDF text fallback (pypdf)
-- ✅ No document-specific hardcoding
-- ✅ No per-PDF code modification required
+### 1) Prérequis
 
----
+- Python 3.11+
+- Ghostscript (requis/recommandé pour Camelot lattice)
 
-# 🧠 Why This Exists
-
-OpenWebUI’s default PDF ingestion:
-
-```
-
-PDF → text extraction → chunking → embedding
-
-```
-
-For complex tables, this causes:
-
-- headers separated from data
-- values without column meaning
-- LLM “guessing” semantics (e.g., inventing Fixe/Mobile labels)
-
-This engine instead performs:
-
-```
-
-PDF → structured table extraction → header reconstruction →
-row-level documents → precise metadata → embedding
-
-````
-
-Result: reliable answers for queries like:
-
-> "Quels sont les tarifs concernant l’Argentine ?"
-
----
-
-# 📦 Installation
-
-## 1️⃣ Clone repository
+### 2) Installation
 
 ```bash
-git clone https://github.com/your-org/openwebui-external-ingestion.git
-cd openwebui-external-ingestion
-````
-
-## 2️⃣ Create virtual environment
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-## 3️⃣ Install dependencies
-
-```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
 pip install -r requirements.txt
 ```
 
-### System dependency (for Camelot lattice)
-
-On Linux:
-
-```bash
-sudo apt install ghostscript
-```
-
----
-
-# 🔧 requirements.txt
-
-```txt
-fastapi
-uvicorn[standard]
-pandas
-tabulate
-pypdf
-camelot-py[cv]
-pdfplumber
-opencv-python
-```
-
----
-
-# 🚀 Run the Engine
+### 3) Configuration
 
 ```bash
 export ENGINE_API_KEY="supersecret"
 export PDF_PAGES="all"
-
-uvicorn app:app --host 0.0.0.0 --port 8088
 ```
 
-Test:
+### 4) Lancement
+
+```bash
+make run
+```
+
+Le service démarre sur `http://0.0.0.0:8088`.
+
+## Exemple reproductible entrée / sortie
+
+### Requête
 
 ```bash
 curl -X PUT "http://localhost:8088/process" \
@@ -124,256 +58,40 @@ curl -X PUT "http://localhost:8088/process" \
   --data-binary "@tarifs.pdf"
 ```
 
----
+### Réponse (extrait)
 
-# 🔌 OpenWebUI Configuration
-
-This engine works with OpenWebUI’s **External Content Extraction Engine**.
-
-## Option A — Docker (Recommended)
-
-If OpenWebUI runs in Docker:
-
-### docker-compose example
-
-```yaml
-services:
-  openwebui:
-    image: ghcr.io/open-webui/open-webui:latest
-    environment:
-      - CONTENT_EXTRACTION_ENGINE=external
-      - EXTERNAL_DOCUMENT_LOADER_URL=http://ingestion-engine:8088
-      - EXTERNAL_DOCUMENT_LOADER_API_KEY=supersecret
-    depends_on:
-      - ingestion-engine
-
-  ingestion-engine:
-    build: .
-    environment:
-      - ENGINE_API_KEY=supersecret
-      - PDF_PAGES=all
-      - MAX_DOC_CHARS=6000
-      - OVERLAP_CHARS=800
-    ports:
-      - "8088:8088"
+```json
+[
+  {
+    "page_content": "Pays: Argentine\nSMS envoyé | Forfait 2€: 0,27 €",
+    "metadata": {
+      "source": "tarifs.pdf",
+      "page": 1,
+      "extractor": "camelot_stream",
+      "table_id": "p001_t001_1a2b3c4d",
+      "format": "row_kv"
+    }
+  }
+]
 ```
 
----
+## Documentation
 
-## Option B — OpenWebUI Local + Engine Local
+- Vue d’ensemble: `docs/overview.md`
+- Architecture: `docs/architecture.md`
+- Cas d’usage: `USE_CASE.md`
+- Valeur métier: `VALUE.md`
+- Statut d’innovation: `INNOVATION_STATUS.md`
 
-If both run locally (no Docker):
+## API
 
-Set OpenWebUI environment variables:
+- `GET /health` → `{"ok": true}`
+- `PUT /process` → liste de documents OpenWebUI (`page_content`, `metadata`)
 
-```bash
-export CONTENT_EXTRACTION_ENGINE=external
-export EXTERNAL_DOCUMENT_LOADER_URL=http://localhost:8088
-export EXTERNAL_DOCUMENT_LOADER_API_KEY=supersecret
-```
+Authentification: header `Authorization: Bearer <ENGINE_API_KEY>`.
 
-Restart OpenWebUI.
+## Notes d’exploitation
 
----
-
-# 📂 How It Works Internally
-
-## 1️⃣ Extraction Order
-
-1. Camelot (lattice)
-2. Camelot (stream)
-3. pdfplumber
-
-## 2️⃣ Header Reconstruction
-
-Automatically detects multi-line headers and rebuilds column names:
-
-Example reconstructed column:
-
-```
-SMS envoyé | Forfait 2€
-```
-
-No schema hardcoding.
-
-## 3️⃣ Row-Level Emission
-
-If first column looks like an entity (e.g. country/destination):
-
-Each row becomes a separate document:
-
-```
-Pays: Argentine
-SMS envoyé | Forfait 2€: 0,27 €
-SMS envoyé | Forfait Free 5G: 0,27 €
-...
-```
-
-This dramatically improves retrieval precision.
-
-## 4️⃣ Table Snapshot
-
-A Markdown snapshot is also stored for full-context retrieval.
-
----
-
-# ⚙️ Environment Variables
-
-| Variable                   | Default    | Description                    |
-| -------------------------- | ---------- | ------------------------------ |
-| ENGINE_API_KEY             | (required) | Must match OpenWebUI key       |
-| PDF_PAGES                  | all        | Pages to parse                 |
-| MAX_DOC_CHARS              | 6000       | Max document size              |
-| OVERLAP_CHARS              | 800        | Chunk overlap                  |
-| MAX_TEXT_PAGES             | 200        | Fallback text extraction limit |
-| MAX_HEADER_ROWS            | 4          | Header detection depth         |
-| CAMELOT_LATTICE_LINE_SCALE | 40         | Lattice tuning                 |
-| CAMELOT_STREAM_EDGE_TOL    | 200        | Stream tuning                  |
-| CAMELOT_STREAM_ROW_TOL     | 10         | Stream tuning                  |
-
----
-
-# 🔍 Troubleshooting
-
-## ❌ “No tables found in table area”
-
-Normal Camelot warning. Automatically handled.
-
-## ❌ Wrong answers after engine update
-
-Delete old Knowledge Base and re-upload PDFs.
-
-Old chunks remain indexed otherwise.
-
-## ❌ Scanned PDF
-
-If text extraction is empty, PDF likely requires OCR.
-
----
-
-# 🧪 Recommended RAG Settings (OpenWebUI)
-
-* Chunk size: 1000–1500 tokens
-* Overlap: 200–300
-* Recursive chunking: enabled
-* Avoid aggressive separators
-
----
-
-# 🏗 Design Philosophy
-
-* No per-document hacks
-* No schema hardcoding
-* Automatic structure detection
-* RAG-first document design
-* Production-safe behavior
-
----
-
-# 📈 Result
-
-Before:
-
-```
-Argentine | 0,27 | 0,27 | 1,05 | ...
-```
-
-LLM invents meaning.
-
-After:
-
-```
-Pays: Argentine
-SMS envoyé | Forfait 2€: 0,27 €
-...
-```
-
-LLM answers correctly without hallucination.
-
----
-
-# 📜 License
-
-MIT
-
----
-
-# 🧭 Pilotage d'innovation (visible et traçable)
-
-## 1) Documentation courte
-
-Ce dépôt contient désormais les artefacts minimaux pour un pilotage lisible par une équipe produit, data et métier :
-
-- un **README opérationnel** (installation, exécution, variables, limites),
-- un **schéma de flux** dans `STATE.md`,
-- un **cas d'usage critique** documenté de bout en bout.
-
-## 2) Schéma de progression (exploration → service)
-
-```mermaid
-flowchart LR
-    E[Exploration] --> POC[POC]
-    POC --> PIL[Pilote]
-    PIL --> STD[Standard]
-    STD --> SVC[Service]
-
-    E -. Hypothèses + faisabilité .-> POC
-    POC -. Validation technique + valeur .-> PIL
-    PIL -. Industrialisation + qualité .-> STD
-    STD -. Exploitation + SLO/SLA .-> SVC
-```
-
-## 3) Code relançable (runbook minimal)
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-export ENGINE_API_KEY="supersecret"
-export PDF_PAGES="all"
-uvicorn app:app --host 0.0.0.0 --port 8088
-```
-
-## 4) Cas d'usage clair
-
-> Ingestion d'un PDF tarifaire complexe pour répondre à une question métier comme :
-> **« Quels sont les tarifs concernant l'Argentine ? »**
-
-Le pipeline conserve la structure tabulaire, émet des documents au niveau ligne, puis retourne un JSON compatible OpenWebUI.
-
-## 5) Valeur business à suivre
-
-Indicateurs proposés pour matérialiser la valeur :
-
-- **Temps gagné** : délai d'onboarding d'un nouveau PDF avant/après moteur externe.
-- **Risque réduit** : taux d'hallucination ou d'erreur de réponse sur jeux de questions de référence.
-- **Coût évité** : baisse des reprises manuelles de correction des connaissances indexées.
-- **Capacité créée** : volume de documents complexes ingérés sans adaptation spécifique.
-
----
-
-# 🤝 Contributions
-
-Pull requests welcome.
-
-Focus areas:
-
-* OCR integration
-* XLSX ingestion
-* Advanced header detection
-* SQL output mode
-* Performance optimization for 100k+ row tables
-
----
-
-```
----
-
-# 🗺️ Project State Artifacts
-
-A current project state file is available in `STATE.md`, including:
-
-- Router / decision flow for the `/process` ingestion path
-- A single critical end-to-end sequence test case
-
+- Variables de chunking : `MAX_DOC_CHARS`, `OVERLAP_CHARS`
+- Limite fallback texte : `MAX_TEXT_PAGES`
+- Tuning extraction : `CAMELOT_LATTICE_LINE_SCALE`, `CAMELOT_STREAM_EDGE_TOL`, `CAMELOT_STREAM_ROW_TOL`
