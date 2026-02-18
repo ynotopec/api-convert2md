@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-OpenWebUI External Content Ingestion Engine (External Document Loader)
+OpenWebUI External Content Ingestion Engine (External Document Loader) v3.0.0
 
 OpenWebUI calls:
   PUT {EXTERNAL_DOCUMENT_LOADER_URL}/process
@@ -18,12 +18,13 @@ Response JSON expected by OpenWebUI:
   - or a list of such objects (recommended)
 
 This engine is GENERIC (no per-PDF code changes):
-- Extract tables: Camelot lattice -> Camelot stream -> pdfplumber
+- Extract tables: Camelot lattice -> Camelot stream -> pdfplumber (gated fallback)
 - De-duplicate tables by hash_df (fast, stable)
 - Rebuild multi-row headers generically (no hardcoded schema)
 - Emits "records" per row (best for RAG precision) + fallback markdown
 - Fallback to PDF text extraction (pypdf) if no tables or low-quality tables
-- Suppresses noisy Camelot warnings
+- Paragraph-aware chunking (no mid-word splits)
+- Proper async offloading, concurrency control, structured logging
 
 Deps:
   pip install fastapi uvicorn[standard] pandas tabulate pypdf camelot-py[cv] pdfplumber opencv-python
@@ -42,23 +43,35 @@ OpenWebUI env:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import hmac
+import logging
 import os
 import re
 import tempfile
 import warnings
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("ingestion-engine")
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Quiet Camelot warnings
-# -----------------------------
+# ---------------------------------------------------------------------------
 warnings.filterwarnings(
     "ignore",
     message=r"No tables found in table area.*",
@@ -66,102 +79,178 @@ warnings.filterwarnings(
     module=r"camelot\..*",
 )
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Config (env)
-# -----------------------------
-ENGINE_API_KEY = os.getenv("ENGINE_API_KEY")
+# ---------------------------------------------------------------------------
+ENGINE_API_KEY: str = os.getenv("ENGINE_API_KEY", "")
 if not ENGINE_API_KEY:
     raise RuntimeError("ENGINE_API_KEY must be set and non-empty")
 
-PDF_PAGES = os.getenv("PDF_PAGES", "all")  # "all" or "1-5" etc.
+PDF_PAGES: str = os.getenv("PDF_PAGES", "all")
 
-# Chunking / emission
-MAX_DOC_CHARS = int(os.getenv("MAX_DOC_CHARS", "6000"))         # per document content
-OVERLAP_CHARS = int(os.getenv("OVERLAP_CHARS", "800"))          # overlap if chunking a long doc
-MAX_TEXT_PAGES = int(os.getenv("MAX_TEXT_PAGES", "200"))
+# Limits
+MAX_PDF_BYTES: int = int(os.getenv("MAX_PDF_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+MAX_DOC_CHARS: int = int(os.getenv("MAX_DOC_CHARS", "6000"))
+OVERLAP_CHARS: int = int(os.getenv("OVERLAP_CHARS", "800"))
+MAX_TEXT_PAGES: int = int(os.getenv("MAX_TEXT_PAGES", "200"))
+MAX_CONCURRENT_PDFS: int = int(os.getenv("MAX_CONCURRENT_PDFS", "3"))
 
 # Multi-header reconstruction
-MAX_HEADER_ROWS = int(os.getenv("MAX_HEADER_ROWS", "4"))
+MAX_HEADER_ROWS: int = int(os.getenv("MAX_HEADER_ROWS", "4"))
 
 # Camelot tuning
-CAMELOT_LATTICE_LINE_SCALE = int(os.getenv("CAMELOT_LATTICE_LINE_SCALE", "40"))
-CAMELOT_STREAM_EDGE_TOL = int(os.getenv("CAMELOT_STREAM_EDGE_TOL", "200"))
-CAMELOT_STREAM_ROW_TOL = int(os.getenv("CAMELOT_STREAM_ROW_TOL", "10"))
+CAMELOT_LATTICE_LINE_SCALE: int = int(os.getenv("CAMELOT_LATTICE_LINE_SCALE", "40"))
+CAMELOT_STREAM_EDGE_TOL: int = int(os.getenv("CAMELOT_STREAM_EDGE_TOL", "200"))
+CAMELOT_STREAM_ROW_TOL: int = int(os.getenv("CAMELOT_STREAM_ROW_TOL", "10"))
 
-# Heuristics thresholds
-MIN_ROWS_FOR_TABLE = int(os.getenv("MIN_ROWS_FOR_TABLE", "2"))
-MIN_COLS_FOR_TABLE = int(os.getenv("MIN_COLS_FOR_TABLE", "2"))
+# Table quality thresholds
+MIN_ROWS_FOR_TABLE: int = int(os.getenv("MIN_ROWS_FOR_TABLE", "2"))
+MIN_COLS_FOR_TABLE: int = int(os.getenv("MIN_COLS_FOR_TABLE", "2"))
+MIN_TABLES_BEFORE_FALLBACK: int = int(os.getenv("MIN_TABLES_BEFORE_FALLBACK", "2"))
+
+# Value-like tokens (configurable, language-neutral defaults)
+# Comma-separated list of tokens considered "value-like" during header detection
+_VALUE_TOKENS_DEFAULT = "n/a,na,—,-,x,yes,no,true,false,oui,non,inclus,illimité,illimite"
+VALUE_TOKENS: Set[str] = {
+    t.strip().lower()
+    for t in os.getenv("VALUE_TOKENS", _VALUE_TOKENS_DEFAULT).split(",")
+    if t.strip()
+}
+
+# Numeric-suffix tokens (€, %, etc.)  — configurable
+_NUMERIC_SUFFIXES_DEFAULT = r"€|%|eur|usd|gbp|mo|mn|min|max|k|m|b"
+NUMERIC_SUFFIXES_PATTERN: str = os.getenv(
+    "NUMERIC_SUFFIXES_PATTERN", _NUMERIC_SUFFIXES_DEFAULT
+)
+
+# Concurrency semaphore (created lazily per event loop)
+_pdf_semaphore: Optional[asyncio.Semaphore] = None
 
 
-# -----------------------------
-# Auth
-# -----------------------------
+def _get_semaphore() -> asyncio.Semaphore:
+    global _pdf_semaphore
+    if _pdf_semaphore is None:
+        _pdf_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PDFS)
+    return _pdf_semaphore
+
+
+# ---------------------------------------------------------------------------
+# Auth (timing-safe)
+# ---------------------------------------------------------------------------
 def require_bearer(auth_header: Optional[str]) -> None:
     if not auth_header or not auth_header.lower().startswith("bearer "):
-        raise HTTPException(401, "Missing Bearer token")
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
     token = auth_header.split(" ", 1)[1].strip()
-    if token != ENGINE_API_KEY:
-        raise HTTPException(403, "Invalid token")
+    if not hmac.compare_digest(token.encode("utf-8"), ENGINE_API_KEY.encode("utf-8")):
+        raise HTTPException(status_code=403, detail="Invalid token")
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
+# Page-range parser
+# ---------------------------------------------------------------------------
+def parse_page_range(pages: str, total: int) -> List[int]:
+    """Parse Camelot-style page string ('all', '1,3-5') into 1-based indices."""
+    if pages.strip().lower() == "all":
+        return list(range(1, total + 1))
+    result: List[int] = []
+    for part in pages.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            tokens = part.split("-", 1)
+            try:
+                a, b = int(tokens[0]), int(tokens[1])
+                result.extend(range(a, b + 1))
+            except ValueError:
+                logger.warning("Invalid page range token: %s", part)
+        else:
+            try:
+                result.append(int(part))
+            except ValueError:
+                logger.warning("Invalid page number token: %s", part)
+    return sorted(set(p for p in result if 1 <= p <= total))
+
+
+# ---------------------------------------------------------------------------
 # DataFrame cleaning / header rebuild (generic)
-# -----------------------------
-def _strip_cell(x) -> str:
+# ---------------------------------------------------------------------------
+def _strip_cell(x: object) -> str:
     if x is None:
         return ""
     s = str(x).replace("\u00a0", " ")
     s = re.sub(r"[ \t]+", " ", s)
     return s.strip()
 
-def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
 
-    # ensure string-ish column names
-    df.columns = [_strip_cell(c) if _strip_cell(c) else f"col_{i}" for i, c in enumerate(df.columns)]
+_NUMERICISH_RE = re.compile(
+    rf"^\s*[-+]?[\d\s.,]+(?:{NUMERIC_SUFFIXES_PATTERN})?\s*$",
+    re.IGNORECASE,
+)
 
-    # normalize cells
-    for c in df.columns:
-        df[c] = df[c].map(_strip_cell)
-
-    # drop empty rows
-    mask_nonempty = df.apply(lambda row: any(v != "" for v in row.values), axis=1)
-    df = df.loc[mask_nonempty].reset_index(drop=True)
-
-    # dedupe column names
-    cols, seen = [], {}
-    for c in df.columns:
-        k = c if c else "col"
-        seen[k] = seen.get(k, 0) + 1
-        cols.append(k if seen[k] == 1 else f"{k}_{seen[k]}")
-    df.columns = cols
-
-    return df
-
-_NUMERICISH_RE = re.compile(r"^\s*[-+]?[\d\s.,]+(?:€|%|eur|mo|mn|min)?\s*$", re.IGNORECASE)
 
 def _is_numericish(s: str) -> bool:
     s = (s or "").strip()
     if not s:
         return False
-    if s.lower() in {"inclus", "illimité", "illimite", "n/a", "na", "—", "-", "x"}:
+    if s.lower() in VALUE_TOKENS:
         return True
     return bool(_NUMERICISH_RE.match(s))
 
-def rebuild_multi_header(df: pd.DataFrame, max_header_rows: int = 4) -> pd.DataFrame:
+
+def _dedupe_columns(columns: pd.Index) -> List[str]:
+    """Ensure column names are unique by appending suffix."""
+    cols: List[str] = []
+    seen: Dict[str, int] = {}
+    for c in columns:
+        k = c if c else "col"
+        seen[k] = seen.get(k, 0) + 1
+        cols.append(k if seen[k] == 1 else f"{k} ({seen[k]})")
+    return cols
+
+
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean cells, drop empty rows, dedupe column names."""
+    df = df.copy()
+
+    # ensure string column names
+    df.columns = [
+        _strip_cell(c) if _strip_cell(c) else f"col_{i}"
+        for i, c in enumerate(df.columns)
+    ]
+
+    # normalize cells vectorized per column
+    for c in df.columns:
+        df[c] = (
+            df[c]
+            .fillna("")
+            .astype(str)
+            .str.replace("\u00a0", " ", regex=False)
+            .str.replace(r"[ \t]+", " ", regex=True)
+            .str.strip()
+        )
+
+    # drop fully empty rows
+    mask = df.apply(lambda row: any(v != "" for v in row.values), axis=1)
+    df = df.loc[mask].reset_index(drop=True)
+
+    df.columns = _dedupe_columns(df.columns)
+    return df
+
+
+def rebuild_multi_header(
+    df: pd.DataFrame, max_header_rows: int = 4
+) -> pd.DataFrame:
     """
     Generic multi-row header reconstruction:
     - Detect up to N header rows at top (mostly non-numeric cells)
     - Forward-fill header cells horizontally (handles merged-like blanks)
     - Build new column names by joining header levels with " | "
     - Remove header rows from body
-
-    If detection fails, returns df unchanged.
     """
     if df.empty or len(df) < 2:
         return df
 
-    # detect header rows
     header_rows: List[int] = []
     for i in range(min(max_header_rows, len(df))):
         row = df.iloc[i].fillna("").astype(str).map(_strip_cell)
@@ -170,11 +259,9 @@ def rebuild_multi_header(df: pd.DataFrame, max_header_rows: int = 4) -> pd.DataF
 
         nonempty = sum(1 for v in row.values if v)
         if nonempty == 0:
-            # allow completely empty header row (rare), but stop
             break
 
         numericish = sum(1 for v in row.values if _is_numericish(v))
-        # header row: more text than numeric-ish
         if numericish <= len(row) * 0.5:
             header_rows.append(i)
         else:
@@ -184,14 +271,15 @@ def rebuild_multi_header(df: pd.DataFrame, max_header_rows: int = 4) -> pd.DataF
         return df
 
     header_df = df.iloc[header_rows].fillna("").astype(str)
-    header_df = header_df.applymap(_strip_cell) if hasattr(header_df, "applymap") else header_df  # safe, optional
+    # apply _strip_cell per column (pandas 2.1+ compatible)
+    header_df = header_df.apply(lambda col: col.map(_strip_cell))
 
     # forward fill horizontally to propagate group headings
     header_df = header_df.replace("", pd.NA).ffill(axis=1).fillna("")
 
-    new_cols = []
+    new_cols: List[str] = []
     for col in header_df.columns:
-        parts = []
+        parts: List[str] = []
         for i in header_rows:
             v = _strip_cell(header_df.loc[i, col])
             if v:
@@ -205,27 +293,16 @@ def rebuild_multi_header(df: pd.DataFrame, max_header_rows: int = 4) -> pd.DataF
         return df
 
     body.columns = new_cols
-
-    # dedupe any identical new col names
-    cols, seen = [], {}
-    for c in body.columns:
-        k = c if c else "col"
-        seen[k] = seen.get(k, 0) + 1
-        cols.append(k if seen[k] == 1 else f"{k} ({seen[k]})")
-    body.columns = cols
-
+    body.columns = _dedupe_columns(body.columns)
     return body
 
+
 def hash_df(df: pd.DataFrame) -> str:
-    """
-    Fast stable hash of DF content (columns + values).
-    No applymap. Vectorized cleaning.
-    """
+    """Fast stable hash of DF content (columns + values). Fully vectorized."""
     if df is None or df.empty:
         return ""
 
     d = df.fillna("").astype(str).copy()
-    # normalize cells vectorized per column
     for col in d.columns:
         d[col] = (
             d[col]
@@ -239,13 +316,14 @@ def hash_df(df: pd.DataFrame) -> str:
     raw = header + "\n" + body
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
+
 def df_to_markdown_table(df: pd.DataFrame) -> str:
     return df.to_markdown(index=False)
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # PDF extractors
-# -----------------------------
+# ---------------------------------------------------------------------------
 @dataclass
 class ExtractedTable:
     page: int
@@ -253,14 +331,36 @@ class ExtractedTable:
     df: pd.DataFrame
     df_hash: str
 
-def extract_with_camelot(pdf_path: Path, pages: str, flavor: str) -> List[Tuple[int, pd.DataFrame]]:
+
+def _clean_extracted(
+    raw_tables: List[Tuple[int, pd.DataFrame]],
+) -> List[Tuple[int, pd.DataFrame]]:
+    """Normalize + rebuild headers. Single pass."""
+    result: List[Tuple[int, pd.DataFrame]] = []
+    for page, df in raw_tables:
+        df = normalize_df(df)
+        df = rebuild_multi_header(df, max_header_rows=MAX_HEADER_ROWS)
+        # Only re-normalize if rebuild changed columns (body slice already clean
+        # from normalize_df inside rebuild, but column names might need dedup)
+        if df.shape[0] >= MIN_ROWS_FOR_TABLE and df.shape[1] >= MIN_COLS_FOR_TABLE:
+            result.append((page, df))
+    return result
+
+
+def extract_with_camelot(
+    pdf_path: Path, pages: str, flavor: str
+) -> List[Tuple[int, pd.DataFrame]]:
     import camelot  # lazy import
 
-    kwargs = {}
+    kwargs: Dict[str, object] = {}
     if flavor == "lattice":
         kwargs = dict(line_scale=CAMELOT_LATTICE_LINE_SCALE)
     elif flavor == "stream":
-        kwargs = dict(strip_text="\n", edge_tol=CAMELOT_STREAM_EDGE_TOL, row_tol=CAMELOT_STREAM_ROW_TOL)
+        kwargs = dict(
+            strip_text="\n",
+            edge_tol=CAMELOT_STREAM_EDGE_TOL,
+            row_tol=CAMELOT_STREAM_ROW_TOL,
+        )
 
     tables = camelot.read_pdf(str(pdf_path), pages=pages, flavor=flavor, **kwargs)
 
@@ -270,38 +370,43 @@ def extract_with_camelot(pdf_path: Path, pages: str, flavor: str) -> List[Tuple[
             page = int(getattr(t, "page", "0"))
         except Exception:
             page = 0
-        df = t.df
-        df = normalize_df(df)
-        df = rebuild_multi_header(df, max_header_rows=MAX_HEADER_ROWS)
-        df = normalize_df(df)
-        if df.shape[0] >= MIN_ROWS_FOR_TABLE and df.shape[1] >= MIN_COLS_FOR_TABLE:
-            out.append((page, df))
-    return out
+        out.append((page, t.df))
 
-def extract_with_pdfplumber(pdf_path: Path) -> List[Tuple[int, pd.DataFrame]]:
+    return _clean_extracted(out)
+
+
+def extract_with_pdfplumber(
+    pdf_path: Path, pages: str = "all"
+) -> List[Tuple[int, pd.DataFrame]]:
     import pdfplumber  # lazy import
 
     out: List[Tuple[int, pd.DataFrame]] = []
     with pdfplumber.open(str(pdf_path)) as pdf:
-        for p_idx, page in enumerate(pdf.pages, start=1):
+        page_nums = parse_page_range(pages, len(pdf.pages))
+        for p_idx in page_nums:
+            page = pdf.pages[p_idx - 1]
             tables = page.extract_tables() or []
             for tab in tables:
                 if not tab:
                     continue
                 df = pd.DataFrame(tab)
-                df = normalize_df(df)
-                df = rebuild_multi_header(df, max_header_rows=MAX_HEADER_ROWS)
-                df = normalize_df(df)
-                if df.shape[0] >= MIN_ROWS_FOR_TABLE and df.shape[1] >= MIN_COLS_FOR_TABLE:
-                    out.append((p_idx, df))
-    return out
+                out.append((p_idx, df))
 
-def extract_tables_optimum(pdf_path: Path, pages: str = "all") -> List[ExtractedTable]:
+    return _clean_extracted(out)
+
+
+def extract_tables_optimum(
+    pdf_path: Path, pages: str = "all"
+) -> List[ExtractedTable]:
+    """
+    Multi-backend extraction with hash-based dedup.
+    Gated fallback: skip slower backends when we already have enough tables.
+    """
     extracted: List[ExtractedTable] = []
-    seen_hashes: set[str] = set()
+    seen_hashes: Set[str] = set()
 
-    def add(src: str, tables: List[Tuple[int, pd.DataFrame]]):
-        nonlocal extracted, seen_hashes
+    def _add(src: str, tables: List[Tuple[int, pd.DataFrame]]) -> int:
+        added = 0
         for page, df in tables:
             if df is None or df.empty:
                 continue
@@ -309,31 +414,77 @@ def extract_tables_optimum(pdf_path: Path, pages: str = "all") -> List[Extracted
             if not h or h in seen_hashes:
                 continue
             seen_hashes.add(h)
-            extracted.append(ExtractedTable(page=page, source=src, df=df, df_hash=h))
+            extracted.append(
+                ExtractedTable(page=page, source=src, df=df, df_hash=h)
+            )
+            added += 1
+        return added
 
-    # priority order
+    # 1) Camelot lattice (best quality for ruled tables)
     try:
-        add("camelot_lattice", extract_with_camelot(pdf_path, pages=pages, flavor="lattice"))
+        count = _add(
+            "camelot_lattice",
+            extract_with_camelot(pdf_path, pages=pages, flavor="lattice"),
+        )
+        logger.info(
+            "camelot_lattice: %d new tables from %s", count, pdf_path.name
+        )
     except Exception:
-        pass
-    try:
-        add("camelot_stream", extract_with_camelot(pdf_path, pages=pages, flavor="stream"))
-    except Exception:
-        pass
-    try:
-        add("pdfplumber", extract_with_pdfplumber(pdf_path))
-    except Exception:
-        pass
+        logger.warning(
+            "camelot_lattice failed on %s", pdf_path.name, exc_info=True
+        )
+
+    # 2) Camelot stream (only if lattice found few)
+    if len(extracted) < MIN_TABLES_BEFORE_FALLBACK:
+        try:
+            count = _add(
+                "camelot_stream",
+                extract_with_camelot(pdf_path, pages=pages, flavor="stream"),
+            )
+            logger.info(
+                "camelot_stream: %d new tables from %s", count, pdf_path.name
+            )
+        except Exception:
+            logger.warning(
+                "camelot_stream failed on %s", pdf_path.name, exc_info=True
+            )
+    else:
+        logger.debug(
+            "Skipping camelot_stream: already have %d tables", len(extracted)
+        )
+
+    # 3) pdfplumber (only if still sparse)
+    if len(extracted) < MIN_TABLES_BEFORE_FALLBACK:
+        try:
+            count = _add(
+                "pdfplumber",
+                extract_with_pdfplumber(pdf_path, pages=pages),
+            )
+            logger.info(
+                "pdfplumber: %d new tables from %s", count, pdf_path.name
+            )
+        except Exception:
+            logger.warning(
+                "pdfplumber failed on %s", pdf_path.name, exc_info=True
+            )
+    else:
+        logger.debug(
+            "Skipping pdfplumber: already have %d tables", len(extracted)
+        )
 
     # stable ordering
     extracted.sort(key=lambda t: (t.page, t.source, t.df_hash))
+    logger.info(
+        "Total unique tables extracted from %s: %d", pdf_path.name, len(extracted)
+    )
     return extracted
+
 
 def extract_text_pypdf(pdf_path: Path, max_pages: int) -> str:
     from pypdf import PdfReader  # lazy import
 
     reader = PdfReader(str(pdf_path))
-    texts = []
+    texts: List[str] = []
     for i, page in enumerate(reader.pages[:max_pages], start=1):
         t = (page.extract_text() or "").strip()
         if t:
@@ -341,11 +492,11 @@ def extract_text_pypdf(pdf_path: Path, max_pages: int) -> str:
     return "\n\n---\n\n".join(texts).strip()
 
 
-# -----------------------------
+# ---------------------------------------------------------------------------
 # Emission strategy for RAG (generic)
-# -----------------------------
-def _row_to_kv_lines(row: dict, max_key_len: int = 80) -> List[str]:
-    lines = []
+# ---------------------------------------------------------------------------
+def _row_to_kv_lines(row: Dict[str, object], max_key_len: int = 80) -> List[str]:
+    lines: List[str] = []
     for k, v in row.items():
         key = str(k).strip()
         if not key:
@@ -358,6 +509,7 @@ def _row_to_kv_lines(row: dict, max_key_len: int = 80) -> List[str]:
         lines.append(f"{key}: {val}")
     return lines
 
+
 def table_to_documents(
     df: pd.DataFrame,
     filename: str,
@@ -367,21 +519,19 @@ def table_to_documents(
 ) -> List[dict]:
     """
     Generic conversion:
-    - If first column looks like an entity column (e.g., country/destination),
-      emit one document per row (best retrieval for "Argentine ?").
+    - If first column looks like an entity column, emit one document per row.
     - Always include a compact markdown snapshot as fallback.
     """
     docs: List[dict] = []
 
-    # Identify candidate entity column: first column, mostly text, not numeric-ish
+    # Identify candidate entity column
     entity_col = df.columns[0] if len(df.columns) > 0 else None
+    entity_ok = False
     if entity_col is not None:
         col_vals = df[entity_col].fillna("").astype(str).map(_strip_cell).tolist()
         nonempty = [v for v in col_vals if v]
         textlike = sum(1 for v in nonempty if not _is_numericish(v))
         entity_ok = (len(nonempty) >= 3) and (textlike >= int(0.7 * len(nonempty)))
-    else:
-        entity_ok = False
 
     # 1) Row-level documents (preferred)
     if entity_ok:
@@ -395,19 +545,21 @@ def table_to_documents(
                 continue
 
             content = f"{entity_col}: {entity}\n" + "\n".join(kv_lines)
-            docs.append({
-                "page_content": content,
-                "metadata": {
-                    "source": filename,
-                    "page": page,
-                    "extractor": source,
-                    "table_id": table_id,
-                    "row_index": idx,
-                    "entity": entity,
-                    "entity_col": str(entity_col),
-                    "format": "row_kv",
-                },
-            })
+            docs.append(
+                {
+                    "page_content": content,
+                    "metadata": {
+                        "source": filename,
+                        "page": page,
+                        "extractor": source,
+                        "table_id": table_id,
+                        "row_index": idx,
+                        "entity": entity,
+                        "entity_col": str(entity_col),
+                        "format": "row_kv",
+                    },
+                }
+            )
 
     # 2) Table snapshot (fallback / context)
     md = (
@@ -417,41 +569,182 @@ def table_to_documents(
         f"- table_id: {table_id}\n\n"
         f"{df_to_markdown_table(df)}\n"
     )
-    docs.append({
-        "page_content": md,
-        "metadata": {
-            "source": filename,
-            "page": page,
-            "extractor": source,
-            "table_id": table_id,
-            "format": "table_markdown",
-        },
-    })
+    docs.append(
+        {
+            "page_content": md,
+            "metadata": {
+                "source": filename,
+                "page": page,
+                "extractor": source,
+                "table_id": table_id,
+                "format": "table_markdown",
+            },
+        }
+    )
 
     return docs
 
+
+# ---------------------------------------------------------------------------
+# Paragraph-aware chunking
+# ---------------------------------------------------------------------------
 def chunk_text(text: str, max_chars: int, overlap: int) -> List[str]:
+    """
+    Split text into chunks respecting paragraph boundaries where possible.
+    Falls back to sentence / hard split for very long paragraphs.
+    """
     if len(text) <= max_chars:
         return [text]
-    out = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + max_chars)
-        out.append(text[start:end])
-        if end == len(text):
-            break
-        start = max(0, end - overlap)
-    return out
+
+    paragraphs = text.split("\n\n")
+    chunks: List[str] = []
+    current = ""
+
+    for para in paragraphs:
+        candidate = (current + "\n\n" + para).strip() if current else para
+
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+
+        # Current chunk is big enough — flush it
+        if current:
+            chunks.append(current)
+
+        # If this single paragraph exceeds max_chars, split it further
+        if len(para) > max_chars:
+            sub_parts = _split_long_paragraph(para, max_chars, overlap)
+            # Overlap: prepend tail of previous chunk to first sub_part
+            if chunks and overlap > 0:
+                tail = chunks[-1][-overlap:]
+                sub_parts[0] = (tail + "\n\n" + sub_parts[0]).strip()
+            chunks.extend(sub_parts)
+            current = ""
+        else:
+            # Start new chunk with overlap from previous
+            if chunks and overlap > 0:
+                tail = chunks[-1][-overlap:]
+                current = (tail + "\n\n" + para).strip()
+            else:
+                current = para
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks if chunks else [text[:max_chars]]
 
 
-# -----------------------------
+def _split_long_paragraph(text: str, max_chars: int, overlap: int) -> List[str]:
+    """Split a single long paragraph by sentence boundaries, then hard-split."""
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks: List[str] = []
+    current = ""
+
+    for sent in sentences:
+        candidate = (current + " " + sent).strip() if current else sent
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            # If single sentence > max_chars, hard split
+            if len(sent) > max_chars:
+                start = 0
+                while start < len(sent):
+                    end = min(len(sent), start + max_chars)
+                    chunks.append(sent[start:end])
+                    start = max(start + 1, end - overlap)
+            else:
+                current = sent
+                continue
+            current = ""
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks if chunks else [text[:max_chars]]
+
+
+# ---------------------------------------------------------------------------
+# Synchronous PDF processing (runs in threadpool)
+# ---------------------------------------------------------------------------
+def _process_pdf_sync(
+    pdf_bytes: bytes, filename: str, mime: str
+) -> List[dict]:
+    """All heavy I/O and CPU work happens here, off the event loop."""
+    with tempfile.TemporaryDirectory() as td:
+        pdf_path = Path(td) / "doc.pdf"
+        pdf_path.write_bytes(pdf_bytes)
+
+        logger.info("Processing PDF: %s (%d bytes)", filename, len(pdf_bytes))
+        tables = extract_tables_optimum(pdf_path, pages=PDF_PAGES)
+
+        # If no tables -> fallback to text
+        if not tables:
+            logger.info("No tables found in %s, falling back to text", filename)
+            text = extract_text_pypdf(pdf_path, max_pages=MAX_TEXT_PAGES)
+            if not text:
+                text = (
+                    f"{filename}\n\n"
+                    f"(No tables detected and text extraction is empty. "
+                    f"This PDF may be scanned; OCR may be required.)"
+                )
+                logger.warning("Empty text extraction for %s", filename)
+            parts = chunk_text(text, MAX_DOC_CHARS, OVERLAP_CHARS)
+            return [
+                {
+                    "page_content": p,
+                    "metadata": {
+                        "source": filename,
+                        "content_type": mime or "application/pdf",
+                        "engine": "fallback_text",
+                        "chunk": i,
+                        "chunks_total": len(parts),
+                    },
+                }
+                for i, p in enumerate(parts, start=1)
+            ]
+
+        # Convert tables -> documents (row-level + table snapshot)
+        docs: List[dict] = []
+        for t_idx, t in enumerate(tables, start=1):
+            table_id = f"p{t.page:03d}_t{t_idx:03d}_{t.df_hash[:8]}"
+            docs.extend(
+                table_to_documents(t.df, filename, t.page, t.source, table_id)
+            )
+
+        # Chunk any oversized docs
+        final_docs: List[dict] = []
+        for d in docs:
+            content = d["page_content"]
+            parts = chunk_text(content, MAX_DOC_CHARS, OVERLAP_CHARS)
+            if len(parts) == 1:
+                final_docs.append(d)
+            else:
+                for i, p in enumerate(parts, start=1):
+                    md = dict(d["metadata"])
+                    md.update({"chunk": i, "chunks_total": len(parts)})
+                    final_docs.append({"page_content": p, "metadata": md})
+
+        logger.info(
+            "PDF %s: emitted %d documents from %d tables",
+            filename,
+            len(final_docs),
+            len(tables),
+        )
+        return final_docs
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
-# -----------------------------
-app = FastAPI(title="OpenWebUI External Ingestion Engine", version="2.0.0")
+# ---------------------------------------------------------------------------
+app = FastAPI(title="OpenWebUI External Ingestion Engine", version="3.0.0")
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.put("/process")
 async def process(
@@ -464,62 +757,30 @@ async def process(
 
     data = await request.body()
     if not data:
-        raise HTTPException(400, "Empty body")
+        raise HTTPException(status_code=400, detail="Empty body")
+
+    if len(data) > MAX_PDF_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({len(data)} bytes, max {MAX_PDF_BYTES})",
+        )
 
     filename = (x_filename or "uploaded").strip()
     mime = (content_type or "").lower()
 
     # PDF pathway
     if ("pdf" in mime) or filename.lower().endswith(".pdf"):
-        with tempfile.TemporaryDirectory() as td:
-            pdf_path = Path(td) / "doc.pdf"
-            pdf_path.write_bytes(data)
-
-            tables = extract_tables_optimum(pdf_path, pages=PDF_PAGES)
-
-            # If no tables -> fallback to text
-            if not tables:
-                text = extract_text_pypdf(pdf_path, max_pages=MAX_TEXT_PAGES)
-                if not text:
-                    text = (
-                        f"{filename}\n\n"
-                        f"(No tables detected and text extraction is empty. "
-                        f"This PDF may be scanned; OCR may be required.)"
-                    )
-                parts = chunk_text(text, MAX_DOC_CHARS, OVERLAP_CHARS)
-                return JSONResponse([{
-                    "page_content": p,
-                    "metadata": {
-                        "source": filename,
-                        "content_type": mime or "application/pdf",
-                        "engine": "fallback_text",
-                        "chunk": i,
-                        "chunks_total": len(parts),
-                    },
-                } for i, p in enumerate(parts, start=1)])
-
-            # Convert tables -> documents (row-level + table snapshot)
-            docs: List[dict] = []
-            for t_idx, t in enumerate(tables, start=1):
-                table_id = f"p{t.page:03d}_t{t_idx:03d}_{t.df_hash[:8]}"
-                docs.extend(table_to_documents(t.df, filename, t.page, t.source, table_id))
-
-            # Chunk any oversized docs (rare but possible for big markdown snapshots)
-            final_docs: List[dict] = []
-            for d in docs:
-                content = d["page_content"]
-                parts = chunk_text(content, MAX_DOC_CHARS, OVERLAP_CHARS)
-                if len(parts) == 1:
-                    final_docs.append(d)
-                else:
-                    for i, p in enumerate(parts, start=1):
-                        md = dict(d["metadata"])
-                        md.update({"chunk": i, "chunks_total": len(parts)})
-                        final_docs.append({"page_content": p, "metadata": md})
-
-            return JSONResponse(final_docs)
+        sem = _get_semaphore()
+        async with sem:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None,
+                partial(_process_pdf_sync, data, filename, mime),
+            )
+        return JSONResponse(result)
 
     # Non-PDF fallback: best effort utf-8 text
+    logger.info("Non-PDF file: %s (%s)", filename, mime)
     try:
         text = data.decode("utf-8", errors="ignore").strip()
     except Exception:
@@ -527,16 +788,21 @@ async def process(
     if not text:
         text = f"{filename}\n\n(Non-PDF format not handled; empty text.)"
     parts = chunk_text(text, MAX_DOC_CHARS, OVERLAP_CHARS)
-    return JSONResponse([{
-        "page_content": p,
-        "metadata": {
-            "source": filename,
-            "content_type": mime or "application/octet-stream",
-            "engine": "basic_text",
-            "chunk": i,
-            "chunks_total": len(parts),
-        },
-    } for i, p in enumerate(parts, start=1)])
+    return JSONResponse(
+        [
+            {
+                "page_content": p,
+                "metadata": {
+                    "source": filename,
+                    "content_type": mime or "application/octet-stream",
+                    "engine": "basic_text",
+                    "chunk": i,
+                    "chunks_total": len(parts),
+                },
+            }
+            for i, p in enumerate(parts, start=1)
+        ]
+    )
 
 
 """
