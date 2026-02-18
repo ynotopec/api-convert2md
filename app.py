@@ -47,7 +47,6 @@ import os
 import re
 import tempfile
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -89,10 +88,6 @@ CAMELOT_STREAM_ROW_TOL = int(os.getenv("CAMELOT_STREAM_ROW_TOL", "10"))
 # Heuristics thresholds
 MIN_ROWS_FOR_TABLE = int(os.getenv("MIN_ROWS_FOR_TABLE", "2"))
 MIN_COLS_FOR_TABLE = int(os.getenv("MIN_COLS_FOR_TABLE", "2"))
-
-# Performance / execution strategy
-PARALLEL_CAMELOT = os.getenv("PARALLEL_CAMELOT", "1").lower() not in {"0", "false", "no"}
-RUN_PDFPLUMBER_IF_CAMELOT_FOUND = os.getenv("RUN_PDFPLUMBER_IF_CAMELOT_FOUND", "0").lower() in {"1", "true", "yes"}
 
 
 # -----------------------------
@@ -315,37 +310,19 @@ def extract_tables_optimum(pdf_path: Path, pages: str = "all") -> List[Extracted
             seen_hashes.add(h)
             extracted.append(ExtractedTable(page=page, source=src, df=df, df_hash=h))
 
-    # Camelot flavors are the most expensive stage; run in parallel when enabled.
-    camelot_results: dict[str, List[Tuple[int, pd.DataFrame]]] = {}
-    if PARALLEL_CAMELOT:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
-                executor.submit(extract_with_camelot, pdf_path, pages, "lattice"): "camelot_lattice",
-                executor.submit(extract_with_camelot, pdf_path, pages, "stream"): "camelot_stream",
-            }
-            for future in as_completed(futures):
-                src = futures[future]
-                try:
-                    camelot_results[src] = future.result()
-                except Exception:
-                    camelot_results[src] = []
-    else:
-        for src, flavor in (("camelot_lattice", "lattice"), ("camelot_stream", "stream")):
-            try:
-                camelot_results[src] = extract_with_camelot(pdf_path, pages=pages, flavor=flavor)
-            except Exception:
-                camelot_results[src] = []
-
-    # keep deterministic priority order for merged output
-    add("camelot_lattice", camelot_results.get("camelot_lattice", []))
-    add("camelot_stream", camelot_results.get("camelot_stream", []))
-
-    # pdfplumber is a slower fallback; skip when Camelot already found tables unless forced on.
-    if RUN_PDFPLUMBER_IF_CAMELOT_FOUND or not extracted:
-        try:
-            add("pdfplumber", extract_with_pdfplumber(pdf_path))
-        except Exception:
-            pass
+    # priority order
+    try:
+        add("camelot_lattice", extract_with_camelot(pdf_path, pages=pages, flavor="lattice"))
+    except Exception:
+        pass
+    try:
+        add("camelot_stream", extract_with_camelot(pdf_path, pages=pages, flavor="stream"))
+    except Exception:
+        pass
+    try:
+        add("pdfplumber", extract_with_pdfplumber(pdf_path))
+    except Exception:
+        pass
 
     # stable ordering
     extracted.sort(key=lambda t: (t.page, t.source, t.df_hash))
