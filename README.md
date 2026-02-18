@@ -298,6 +298,61 @@ MIT
 
 ---
 
+# 🧭 Pilotage d'innovation (visible et traçable)
+
+## 1) Documentation courte
+
+Ce dépôt contient désormais les artefacts minimaux pour un pilotage lisible par une équipe produit, data et métier :
+
+- un **README opérationnel** (installation, exécution, variables, limites),
+- un **schéma de flux** dans `STATE.md`,
+- un **cas d'usage critique** documenté de bout en bout.
+
+## 2) Schéma de progression (exploration → service)
+
+```mermaid
+flowchart LR
+    E[Exploration] --> POC[POC]
+    POC --> PIL[Pilote]
+    PIL --> STD[Standard]
+    STD --> SVC[Service]
+
+    E -. Hypothèses + faisabilité .-> POC
+    POC -. Validation technique + valeur .-> PIL
+    PIL -. Industrialisation + qualité .-> STD
+    STD -. Exploitation + SLO/SLA .-> SVC
+```
+
+## 3) Code relançable (runbook minimal)
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+export ENGINE_API_KEY="supersecret"
+export PDF_PAGES="all"
+uvicorn app:app --host 0.0.0.0 --port 8088
+```
+
+## 4) Cas d'usage clair
+
+> Ingestion d'un PDF tarifaire complexe pour répondre à une question métier comme :
+> **« Quels sont les tarifs concernant l'Argentine ? »**
+
+Le pipeline conserve la structure tabulaire, émet des documents au niveau ligne, puis retourne un JSON compatible OpenWebUI.
+
+## 5) Valeur business à suivre
+
+Indicateurs proposés pour matérialiser la valeur :
+
+- **Temps gagné** : délai d'onboarding d'un nouveau PDF avant/après moteur externe.
+- **Risque réduit** : taux d'hallucination ou d'erreur de réponse sur jeux de questions de référence.
+- **Coût évité** : baisse des reprises manuelles de correction des connaissances indexées.
+- **Capacité créée** : volume de documents complexes ingérés sans adaptation spécifique.
+
+---
+
 # 🤝 Contributions
 
 Pull requests welcome.
@@ -321,5 +376,4 @@ A current project state file is available in `STATE.md`, including:
 
 - Router / decision flow for the `/process` ingestion path
 - A single critical end-to-end sequence test case
-
 
