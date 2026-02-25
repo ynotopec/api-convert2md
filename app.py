@@ -47,9 +47,10 @@ import os
 import re
 import tempfile
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -91,6 +92,7 @@ CAMELOT_STREAM_ROW_TOL = int(os.getenv("CAMELOT_STREAM_ROW_TOL", "10"))
 # Heuristics thresholds
 MIN_ROWS_FOR_TABLE = int(os.getenv("MIN_ROWS_FOR_TABLE", "2"))
 MIN_COLS_FOR_TABLE = int(os.getenv("MIN_COLS_FOR_TABLE", "2"))
+EXTRACTOR_WORKERS = int(os.getenv("EXTRACTOR_WORKERS", "3"))
 
 
 # -----------------------------
@@ -243,6 +245,36 @@ def df_to_markdown_table(df: pd.DataFrame) -> str:
     return df.to_markdown(index=False)
 
 
+def parse_pages_spec(pages: str) -> Optional[Set[int]]:
+    """
+    Parse Camelot-style page selector into a concrete page set.
+    Examples: "all", "1", "1,3,5", "1-4,8".
+    Returns None when all pages are requested.
+    """
+    raw = (pages or "all").strip().lower()
+    if raw in {"", "all"}:
+        return None
+
+    out: Set[int] = set()
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "-" in token:
+            a, b = token.split("-", 1)
+            if not (a.strip().isdigit() and b.strip().isdigit()):
+                continue
+            start, end = int(a), int(b)
+            if start <= 0 or end <= 0:
+                continue
+            lo, hi = (start, end) if start <= end else (end, start)
+            out.update(range(lo, hi + 1))
+            continue
+        if token.isdigit() and int(token) > 0:
+            out.add(int(token))
+    return out or None
+
+
 # -----------------------------
 # PDF extractors
 # -----------------------------
@@ -278,12 +310,15 @@ def extract_with_camelot(pdf_path: Path, pages: str, flavor: str) -> List[Tuple[
             out.append((page, df))
     return out
 
-def extract_with_pdfplumber(pdf_path: Path) -> List[Tuple[int, pd.DataFrame]]:
+def extract_with_pdfplumber(pdf_path: Path, pages: str) -> List[Tuple[int, pd.DataFrame]]:
     import pdfplumber  # lazy import
 
+    selected_pages = parse_pages_spec(pages)
     out: List[Tuple[int, pd.DataFrame]] = []
     with pdfplumber.open(str(pdf_path)) as pdf:
         for p_idx, page in enumerate(pdf.pages, start=1):
+            if selected_pages is not None and p_idx not in selected_pages:
+                continue
             tables = page.extract_tables() or []
             for tab in tables:
                 if not tab:
@@ -311,19 +346,26 @@ def extract_tables_optimum(pdf_path: Path, pages: str = "all") -> List[Extracted
             seen_hashes.add(h)
             extracted.append(ExtractedTable(page=page, source=src, df=df, df_hash=h))
 
-    # priority order
-    try:
-        add("camelot_lattice", extract_with_camelot(pdf_path, pages=pages, flavor="lattice"))
-    except Exception:
-        pass
-    try:
-        add("camelot_stream", extract_with_camelot(pdf_path, pages=pages, flavor="stream"))
-    except Exception:
-        pass
-    try:
-        add("pdfplumber", extract_with_pdfplumber(pdf_path))
-    except Exception:
-        pass
+    extractor_order = ["camelot_lattice", "camelot_stream", "pdfplumber"]
+    run_specs = {
+        "camelot_lattice": lambda: extract_with_camelot(pdf_path, pages=pages, flavor="lattice"),
+        "camelot_stream": lambda: extract_with_camelot(pdf_path, pages=pages, flavor="stream"),
+        "pdfplumber": lambda: extract_with_pdfplumber(pdf_path, pages=pages),
+    }
+
+    results: dict[str, List[Tuple[int, pd.DataFrame]]] = {k: [] for k in extractor_order}
+    worker_count = max(1, min(EXTRACTOR_WORKERS, len(extractor_order)))
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = {pool.submit(run_specs[name]): name for name in extractor_order}
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                results[name] = fut.result()
+            except Exception:
+                results[name] = []
+
+    for src in extractor_order:
+        add(src, results[src])
 
     # stable ordering
     extracted.sort(key=lambda t: (t.page, t.source, t.df_hash))
