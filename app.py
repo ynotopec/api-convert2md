@@ -42,6 +42,7 @@ OpenWebUI env:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -55,6 +56,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
+import aiofiles
 import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -548,6 +550,49 @@ def chunk_text(text: str, max_chars: int, overlap: int) -> List[str]:
     return out
 
 
+def process_pdf_sync(pdf_path: Path, filename: str, mime: str) -> List[dict]:
+    """Synchronous PDF extraction pipeline. Run with asyncio.to_thread."""
+    tables = extract_tables_optimum(pdf_path, pages=PDF_PAGES)
+
+    if not tables:
+        text = extract_text_pypdf(pdf_path, max_pages=MAX_TEXT_PAGES)
+        if not text:
+            text = (
+                f"{filename}\n\n"
+                f"(No tables detected and text extraction is empty. "
+                f"This PDF may be scanned; OCR may be required.)"
+            )
+        parts = chunk_text(text, MAX_DOC_CHARS, OVERLAP_CHARS)
+        return [{
+            "page_content": p,
+            "metadata": {
+                "source": filename,
+                "content_type": mime or "application/pdf",
+                "engine": "fallback_text",
+                "chunk": i,
+                "chunks_total": len(parts),
+            },
+        } for i, p in enumerate(parts, start=1)]
+
+    docs: List[dict] = []
+    for t_idx, t in enumerate(tables, start=1):
+        table_id = f"p{t.page:03d}_t{t_idx:03d}_{t.df_hash[:8]}"
+        docs.extend(table_to_documents(t.df, filename, t.page, t.source, table_id))
+
+    final_docs: List[dict] = []
+    for d in docs:
+        content = d["page_content"]
+        parts = chunk_text(content, MAX_DOC_CHARS, OVERLAP_CHARS)
+        if len(parts) == 1:
+            final_docs.append(d)
+            continue
+        for i, p in enumerate(parts, start=1):
+            md = dict(d["metadata"])
+            md.update({"chunk": i, "chunks_total": len(parts)})
+            final_docs.append({"page_content": p, "metadata": md})
+    return final_docs
+
+
 # -----------------------------
 # FastAPI app
 # -----------------------------
@@ -566,62 +611,24 @@ async def process(
 ):
     require_bearer(authorization)
 
-    data = await request.body()
-    if not data:
-        raise HTTPException(400, "Empty body")
-
     filename = (x_filename or "uploaded").strip() or "uploaded"
     mime = (content_type or "").lower()
 
-    # PDF pathway
-    if ("pdf" in mime) or filename.lower().endswith(".pdf"):
-        with tempfile.TemporaryDirectory() as td:
-            pdf_path = Path(td) / "doc.pdf"
-            pdf_path.write_bytes(data)
+    with tempfile.TemporaryDirectory() as td:
+        file_path = Path(td) / "upload.bin"
+        async with aiofiles.open(file_path, "wb") as f:
+            async for chunk in request.stream():
+                await f.write(chunk)
 
-            tables = extract_tables_optimum(pdf_path, pages=PDF_PAGES)
+        if file_path.stat().st_size == 0:
+            raise HTTPException(400, "Empty file uploaded")
 
-            # If no tables -> fallback to text
-            if not tables:
-                text = extract_text_pypdf(pdf_path, max_pages=MAX_TEXT_PAGES)
-                if not text:
-                    text = (
-                        f"{filename}\n\n"
-                        f"(No tables detected and text extraction is empty. "
-                        f"This PDF may be scanned; OCR may be required.)"
-                    )
-                parts = chunk_text(text, MAX_DOC_CHARS, OVERLAP_CHARS)
-                return JSONResponse([{
-                    "page_content": p,
-                    "metadata": {
-                        "source": filename,
-                        "content_type": mime or "application/pdf",
-                        "engine": "fallback_text",
-                        "chunk": i,
-                        "chunks_total": len(parts),
-                    },
-                } for i, p in enumerate(parts, start=1)])
+        # PDF pathway
+        if ("pdf" in mime) or filename.lower().endswith(".pdf"):
+            docs = await asyncio.to_thread(process_pdf_sync, file_path, filename, mime)
+            return JSONResponse(docs)
 
-            # Convert tables -> documents (row-level + table snapshot)
-            docs: List[dict] = []
-            for t_idx, t in enumerate(tables, start=1):
-                table_id = f"p{t.page:03d}_t{t_idx:03d}_{t.df_hash[:8]}"
-                docs.extend(table_to_documents(t.df, filename, t.page, t.source, table_id))
-
-            # Chunk any oversized docs (rare but possible for big markdown snapshots)
-            final_docs: List[dict] = []
-            for d in docs:
-                content = d["page_content"]
-                parts = chunk_text(content, MAX_DOC_CHARS, OVERLAP_CHARS)
-                if len(parts) == 1:
-                    final_docs.append(d)
-                else:
-                    for i, p in enumerate(parts, start=1):
-                        md = dict(d["metadata"])
-                        md.update({"chunk": i, "chunks_total": len(parts)})
-                        final_docs.append({"page_content": p, "metadata": md})
-
-            return JSONResponse(final_docs)
+        data = file_path.read_bytes()
 
     # Non-PDF fallback: Apache Tika (if configured) -> utf-8 best effort
     tika_text = extract_text_tika(data=data, filename=filename, mime=mime)
