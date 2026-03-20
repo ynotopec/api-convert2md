@@ -43,9 +43,12 @@ OpenWebUI env:
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import tempfile
+import urllib.error
+import urllib.request
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -93,6 +96,10 @@ CAMELOT_STREAM_ROW_TOL = int(os.getenv("CAMELOT_STREAM_ROW_TOL", "10"))
 MIN_ROWS_FOR_TABLE = int(os.getenv("MIN_ROWS_FOR_TABLE", "2"))
 MIN_COLS_FOR_TABLE = int(os.getenv("MIN_COLS_FOR_TABLE", "2"))
 EXTRACTOR_WORKERS = int(os.getenv("EXTRACTOR_WORKERS", "3"))
+
+# Optional Apache Tika fallback for non-PDF or hard files
+TIKA_URL = (os.getenv("TIKA_URL") or "").strip().rstrip("/")
+TIKA_TIMEOUT_S = int(os.getenv("TIKA_TIMEOUT_S", "30"))
 
 
 # -----------------------------
@@ -382,6 +389,49 @@ def extract_text_pypdf(pdf_path: Path, max_pages: int) -> str:
             texts.append(f"## page {i}\n\n{t}\n")
     return "\n\n---\n\n".join(texts).strip()
 
+def extract_text_tika(data: bytes, filename: str, mime: str) -> str:
+    """
+    Call Apache Tika server if configured.
+    Uses /rmeta/text endpoint and concatenates textual content.
+    Returns an empty string on any failure.
+    """
+    if not TIKA_URL:
+        return ""
+
+    endpoint = f"{TIKA_URL}/rmeta/text"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": mime or "application/octet-stream",
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    }
+    req = urllib.request.Request(endpoint, data=data, headers=headers, method="PUT")
+    try:
+        with urllib.request.urlopen(req, timeout=TIKA_TIMEOUT_S) as resp:
+            payload = resp.read().decode("utf-8", errors="ignore")
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return ""
+    except Exception:
+        return ""
+
+    try:
+        parsed = json.loads(payload)
+    except Exception:
+        return ""
+
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return ""
+
+    texts: List[str] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        text = _strip_cell(item.get("X-TIKA:content", ""))
+        if text:
+            texts.append(text)
+    return "\n\n---\n\n".join(texts).strip()
+
 
 # -----------------------------
 # Emission strategy for RAG (generic)
@@ -561,7 +611,21 @@ async def process(
 
             return JSONResponse(final_docs)
 
-    # Non-PDF fallback: best effort utf-8 text
+    # Non-PDF fallback: Apache Tika (if configured) -> utf-8 best effort
+    tika_text = extract_text_tika(data=data, filename=filename, mime=mime)
+    if tika_text:
+        parts = chunk_text(tika_text, MAX_DOC_CHARS, OVERLAP_CHARS)
+        return JSONResponse([{
+            "page_content": p,
+            "metadata": {
+                "source": filename,
+                "content_type": mime or "application/octet-stream",
+                "engine": "tika_text",
+                "chunk": i,
+                "chunks_total": len(parts),
+            },
+        } for i, p in enumerate(parts, start=1)])
+
     try:
         text = data.decode("utf-8", errors="ignore").strip()
     except Exception:
