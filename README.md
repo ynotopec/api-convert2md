@@ -121,3 +121,6 @@ services:
 - Limite fallback texte : `MAX_TEXT_PAGES`
 - Tuning extraction : `CAMELOT_LATTICE_LINE_SCALE`, `CAMELOT_STREAM_EDGE_TOL`, `CAMELOT_STREAM_ROW_TOL`
 - Parallélisme des extracteurs : `EXTRACTOR_WORKERS` (défaut: `3`)
+- Fallback Apache Tika (non-PDF) :
+  - `TIKA_URL` (ex: `http://tika:9998`)
+  - `TIKA_TIMEOUT_S` (défaut: `30`)
