@@ -482,7 +482,9 @@ def table_to_documents(
             entity = _strip_cell(row.get(entity_col, ""))
             if not entity:
                 continue
-            kv_lines = _row_to_kv_lines(row)
+            row_without_entity = dict(row)
+            row_without_entity.pop(entity_col, None)
+            kv_lines = _row_to_kv_lines(row_without_entity)
             if not kv_lines:
                 continue
 
@@ -523,6 +525,13 @@ def table_to_documents(
     return docs
 
 def chunk_text(text: str, max_chars: int, overlap: int) -> List[str]:
+    if max_chars <= 0:
+        raise ValueError("max_chars must be > 0")
+    if overlap < 0:
+        raise ValueError("overlap must be >= 0")
+    if overlap >= max_chars:
+        overlap = max_chars - 1
+
     if len(text) <= max_chars:
         return [text]
     out = []
@@ -532,7 +541,10 @@ def chunk_text(text: str, max_chars: int, overlap: int) -> List[str]:
         out.append(text[start:end])
         if end == len(text):
             break
-        start = max(0, end - overlap)
+        next_start = max(0, end - overlap)
+        if next_start <= start:
+            next_start = end
+        start = next_start
     return out
 
 
@@ -558,7 +570,7 @@ async def process(
     if not data:
         raise HTTPException(400, "Empty body")
 
-    filename = (x_filename or "uploaded").strip()
+    filename = (x_filename or "uploaded").strip() or "uploaded"
     mime = (content_type or "").lower()
 
     # PDF pathway
