@@ -46,6 +46,7 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 import re
 import tempfile
 import urllib.error
@@ -75,9 +76,12 @@ warnings.filterwarnings(
 # -----------------------------
 # Config (env)
 # -----------------------------
-ENGINE_API_KEY = os.getenv("ENGINE_API_KEY")
-if not ENGINE_API_KEY:
-    raise RuntimeError("ENGINE_API_KEY must be set and non-empty")
+API_TOKEN = (os.getenv("API_TOKEN") or os.getenv("ENGINE_API_KEY") or "").strip()
+if not API_TOKEN:
+    raise RuntimeError("API_TOKEN (or legacy ENGINE_API_KEY) must be set and non-empty")
+
+# Backward-compatible name for OpenWebUI installations that still export ENGINE_API_KEY.
+ENGINE_API_KEY = API_TOKEN
 
 PDF_PAGES = os.getenv("PDF_PAGES", "all")  # "all" or "1-5" etc.
 
@@ -111,7 +115,7 @@ def require_bearer(auth_header: Optional[str]) -> None:
     if not auth_header or not auth_header.lower().startswith("bearer "):
         raise HTTPException(401, "Missing Bearer token")
     token = auth_header.split(" ", 1)[1].strip()
-    if token != ENGINE_API_KEY:
+    if not secrets.compare_digest(token, API_TOKEN):
         raise HTTPException(403, "Invalid token")
 
 
@@ -596,11 +600,118 @@ def process_pdf_sync(pdf_path: Path, filename: str, mime: str) -> List[dict]:
 # -----------------------------
 # FastAPI app
 # -----------------------------
-app = FastAPI(title="OpenWebUI External Ingestion Engine", version="2.0.0")
+app = FastAPI(
+    title="API Convert2MD",
+    version="2.1.0",
+    description="Token-protected document-to-Markdown API with OpenWebUI compatibility.",
+)
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "api-convert2md",
+        "endpoints": ["GET /health", "POST /v1/convert", "PUT /process"],
+    }
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.get("/healthz")
+def healthz():
+    return health()
+
+@app.get("/readyz")
+def readyz():
+    return health()
+
+def _documents_to_markdown(docs: List[dict]) -> str:
+    parts: List[str] = []
+    for idx, doc in enumerate(docs, start=1):
+        content = _strip_cell(doc.get("page_content", ""))
+        if not content:
+            continue
+        if parts:
+            parts.append("\n\n---\n")
+        parts.append(f"<!-- document:{idx} -->\n")
+        parts.append(content)
+    return "\n".join(parts).strip()
+
+async def _convert_upload_to_docs(upload) -> Tuple[List[dict], str, str]:
+    filename = (upload.filename or "uploaded").strip() or "uploaded"
+    mime = (upload.content_type or "application/octet-stream").lower()
+
+    with tempfile.TemporaryDirectory() as td:
+        file_path = Path(td) / "upload.bin"
+        async with aiofiles.open(file_path, "wb") as f:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                await f.write(chunk)
+
+        if file_path.stat().st_size == 0:
+            raise HTTPException(400, "Empty file uploaded")
+
+        if ("pdf" in mime) or filename.lower().endswith(".pdf"):
+            docs = await asyncio.to_thread(process_pdf_sync, file_path, filename, mime)
+            return docs, filename, mime
+
+        data = file_path.read_bytes()
+
+    tika_text = extract_text_tika(data=data, filename=filename, mime=mime)
+    if tika_text:
+        parts = chunk_text(tika_text, MAX_DOC_CHARS, OVERLAP_CHARS)
+        return ([{
+            "page_content": p,
+            "metadata": {
+                "source": filename,
+                "content_type": mime,
+                "engine": "tika_text",
+                "chunk": i,
+                "chunks_total": len(parts),
+            },
+        } for i, p in enumerate(parts, start=1)], filename, mime)
+
+    text = data.decode("utf-8", errors="ignore").strip()
+    if not text:
+        text = f"{filename}\n\n(Non-PDF format not handled; empty text.)"
+    parts = chunk_text(text, MAX_DOC_CHARS, OVERLAP_CHARS)
+    return ([{
+        "page_content": p,
+        "metadata": {
+            "source": filename,
+            "content_type": mime,
+            "engine": "basic_text",
+            "chunk": i,
+            "chunks_total": len(parts),
+        },
+    } for i, p in enumerate(parts, start=1)], filename, mime)
+
+@app.post("/convert")
+@app.post("/v1/convert")
+async def convert(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Popular multipart REST API: upload one file and receive Markdown plus chunks."""
+    require_bearer(authorization)
+    try:
+        form = await request.form()
+    except AssertionError as exc:
+        raise HTTPException(500, "python-multipart is required for multipart uploads") from exc
+    upload = form.get("file")
+    if upload is None or not hasattr(upload, "read"):
+        raise HTTPException(400, "Missing multipart file field named 'file'")
+    docs, filename, mime = await _convert_upload_to_docs(upload)
+    markdown = _documents_to_markdown(docs)
+    return JSONResponse({
+        "filename": filename,
+        "content_type": mime,
+        "markdown": markdown,
+        "documents": docs,
+    })
 
 @app.put("/process")
 async def process(

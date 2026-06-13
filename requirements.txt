@@ -1,13 +1,11 @@
-fastapi
-uvicorn[standard]
-pandas
-tabulate
-requests
-
-# PDF tables (recommandé)
-camelot-py[cv]
-pdfplumber
-opencv-python
-
-pypdf
 aiofiles
+camelot-py[cv]
+fastapi
+opencv-python-headless
+pandas
+pdfplumber
+pypdf
+python-multipart
+requests
+tabulate
+uvicorn[standard]

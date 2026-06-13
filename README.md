@@ -1,127 +1,64 @@
-# API Convert2MD – OpenWebUI External Ingestion Engine
+# API Convert2MD
 
-Service FastAPI prêt à l’emploi pour brancher OpenWebUI sur un moteur d’extraction PDF orienté tableaux.
+Minimal token-protected FastAPI service that converts uploaded documents to Markdown and keeps OpenWebUI External Document Loader compatibility.
 
-## Objectif
+## Features
 
-Convertir des PDFs complexes (grilles tarifaires, matrices, tableaux multi-entêtes) en documents structurés adaptés au RAG, avec une stratégie de fallback robuste.
+- Idempotent install/start scripts: safe to run repeatedly.
+- `uv` dependency management.
+- Virtual environment at `~/venv/api-convert2md` by default.
+- Token API with `Authorization: Bearer <API_TOKEN>`.
+- Popular multipart API: `POST /v1/convert` (alias: `POST /convert`).
+- OpenWebUI-compatible API: `PUT /process`.
+- CPU-first deployment compatible with NVIDIA H100/DGX Spark hosts; GPU presence is not required.
 
-## Fonctionnalités clés
-
-- Extraction de tableaux : Camelot `lattice` → Camelot `stream` → `pdfplumber`
-- Reconstruction automatique des entêtes multi-lignes
-- Déduplication des tableaux via hash stable
-- Emission de documents par ligne + snapshot markdown de tableau
-- Fallback texte PDF via `pypdf`
-- Endpoint compatible OpenWebUI `PUT /process`
-
-## Démarrage rapide (≤ 10 minutes)
-
-### 1) Prérequis
-
-- Python 3.11+
-- Ghostscript (requis/recommandé pour Camelot lattice)
-
-### 2) Installation
+## Start
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
+cp .env.example .env
+# edit .env and set API_TOKEN
+./install.sh
+source ./run.sh 0.0.0.0 8088
 ```
 
-### 3) Configuration
+Health check:
 
 ```bash
-export ENGINE_API_KEY="supersecret"
-export PDF_PAGES="all"
+curl http://127.0.0.1:8088/health
 ```
 
-### 4) Lancement
+Convert a file:
 
 ```bash
-make run
+curl -X POST http://127.0.0.1:8088/v1/convert \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -F "file=@document.pdf"
 ```
 
-Le service démarre sur `http://0.0.0.0:8088`.
-
-## Exemple reproductible entrée / sortie
-
-### Requête
+OpenWebUI:
 
 ```bash
-curl -X PUT "http://localhost:8088/process" \
-  -H "Authorization: Bearer supersecret" \
-  -H "Content-Type: application/pdf" \
-  -H "X-Filename: tarifs.pdf" \
-  --data-binary "@tarifs.pdf"
+CONTENT_EXTRACTION_ENGINE=external
+EXTERNAL_DOCUMENT_LOADER_URL=http://127.0.0.1:8088
+EXTERNAL_DOCUMENT_LOADER_API_KEY=$API_TOKEN
 ```
 
-### Réponse (extrait)
+## systemd example
 
-```json
-[
-  {
-    "page_content": "Pays: Argentine\nSMS envoyé | Forfait 2€: 0,27 €",
-    "metadata": {
-      "source": "tarifs.pdf",
-      "page": 1,
-      "extractor": "camelot_stream",
-      "table_id": "p001_t001_1a2b3c4d",
-      "format": "row_kv"
-    }
-  }
-]
+Use `run.sh` directly from systemd; it uses `exec` when not sourced.
+
+```ini
+[Service]
+WorkingDirectory=/workspace/api-convert2md
+EnvironmentFile=/workspace/api-convert2md/.env
+ExecStart=/workspace/api-convert2md/run.sh 0.0.0.0 8088
+Restart=always
 ```
 
-## Documentation
+## System packages
 
-- Vue d’ensemble: `docs/overview.md`
-- Architecture: `docs/architecture.md`
-- Cas d’usage: `USE_CASE.md`
-- Valeur métier: `VALUE.md`
-- Pitch métier (prêt à présenter): `PITCH_METIER.md`
-- Statut d’innovation: `INNOVATION_STATUS.md`
+For best PDF table extraction, install Ghostscript on the host:
 
-## API
-
-- `GET /health` → `{"ok": true}`
-- `PUT /process` → liste de documents OpenWebUI (`page_content`, `metadata`)
-
-Authentification: header `Authorization: Bearer <ENGINE_API_KEY>`.
-
-## Configuration OpenWebUI
-
-### Option A — via variables d’environnement (Docker Compose)
-
-Dans le service `open-webui`, ajoutez les variables suivantes :
-
-```yaml
-services:
-  open-webui:
-    environment:
-      - CONTENT_EXTRACTION_ENGINE=external
-      - EXTERNAL_DOCUMENT_LOADER_URL=http://ingestion-engine:8088
-      - EXTERNAL_DOCUMENT_LOADER_API_KEY=supersecret
+```bash
+sudo apt-get install -y ghostscript
 ```
-
-### Option B — via l’interface OpenWebUI (UI)
-
-1. Ouvrir **Admin Panel**.
-2. Aller dans **Settings** → **Documents** (ou **Files / Document Processing** selon la version).
-3. Choisir **Content Extraction Engine** = `external`.
-4. Renseigner **External Document Loader URL** = `http://ingestion-engine:8088`.
-5. Renseigner **External Document Loader API Key** = `supersecret`.
-6. Sauvegarder, puis tester l’import d’un PDF.
-
-## Notes d’exploitation
-
-- Variables de chunking : `MAX_DOC_CHARS`, `OVERLAP_CHARS`
-  - Recommandation: garder `OVERLAP_CHARS < MAX_DOC_CHARS` (si ce n’est pas le cas, l’application réduit automatiquement l’overlap pour éviter des boucles de chunking).
-- Limite fallback texte : `MAX_TEXT_PAGES`
-- Tuning extraction : `CAMELOT_LATTICE_LINE_SCALE`, `CAMELOT_STREAM_EDGE_TOL`, `CAMELOT_STREAM_ROW_TOL`
-- Parallélisme des extracteurs : `EXTRACTOR_WORKERS` (défaut: `3`)
-- Fallback Apache Tika (non-PDF) :
-  - `TIKA_URL` (ex: `http://tika:9998`)
-  - `TIKA_TIMEOUT_S` (défaut: `30`)
