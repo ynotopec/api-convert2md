@@ -55,6 +55,18 @@ ExecStart=/workspace/api-convert2md/run.sh 0.0.0.0 8088
 Restart=always
 ```
 
+## PDF processing speed
+
+The default PDF table strategy is `fast`: the service tries extractors in order and stops as soon as one returns usable tables. This avoids waiting for slower fallback extractors on documents that Camelot can already parse.
+
+For maximum recall, set `PDF_TABLE_STRATEGY=quality` to run every enabled extractor and de-duplicate the results. You can also reduce work further by selecting a subset/order of extractors, for example:
+
+```bash
+PDF_TABLE_STRATEGY=fast
+PDF_TABLE_EXTRACTORS=camelot_lattice,pdfplumber
+PDF_PAGES=1-10
+```
+
 ## System packages
 
 For best PDF table extraction, install Ghostscript on the host:
