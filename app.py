@@ -156,6 +156,15 @@ CAMELOT_STREAM_ROW_TOL = int(os.getenv("CAMELOT_STREAM_ROW_TOL", "10"))
 # Heuristics thresholds
 MIN_ROWS_FOR_TABLE = int(os.getenv("MIN_ROWS_FOR_TABLE", "2"))
 MIN_COLS_FOR_TABLE = int(os.getenv("MIN_COLS_FOR_TABLE", "2"))
+
+# Table extraction strategy:
+# - fast: run extractors sequentially and stop after the first extractor with tables.
+# - quality/optimum/all: run all enabled extractors and de-duplicate their results.
+PDF_TABLE_STRATEGY = os.getenv("PDF_TABLE_STRATEGY", "fast").strip().lower()
+PDF_TABLE_EXTRACTORS_RAW = os.getenv(
+    "PDF_TABLE_EXTRACTORS",
+    "camelot_lattice,camelot_stream,pdfplumber",
+)
 EXTRACTOR_WORKERS = int(os.getenv("EXTRACTOR_WORKERS", "3"))
 
 # Optional Apache Tika fallback for non-PDF or hard files
@@ -343,6 +352,30 @@ def parse_pages_spec(pages: str) -> Optional[Set[int]]:
     return out or None
 
 
+SUPPORTED_TABLE_EXTRACTORS = ("camelot_lattice", "camelot_stream", "pdfplumber")
+
+
+def parse_table_extractors(raw: str) -> List[str]:
+    """Parse and validate the enabled table extractors in execution order."""
+    names = []
+    seen = set()
+    for token in (raw or "").split(","):
+        name = token.strip().lower()
+        if not name or name in seen:
+            continue
+        if name not in SUPPORTED_TABLE_EXTRACTORS:
+            logging.getLogger(__name__).warning(
+                "Ignoring unsupported PDF table extractor %r", name
+            )
+            continue
+        seen.add(name)
+        names.append(name)
+    return names or list(SUPPORTED_TABLE_EXTRACTORS)
+
+
+PDF_TABLE_EXTRACTORS = parse_table_extractors(PDF_TABLE_EXTRACTORS_RAW)
+
+
 # -----------------------------
 # PDF extractors
 # -----------------------------
@@ -401,45 +434,113 @@ def extract_with_pdfplumber(pdf_path: Path, pages: str) -> List[Tuple[int, pd.Da
                     out.append((p_idx, df))
     return out
 
-def extract_tables_optimum(pdf_path: Path, pages: str = "all") -> List[ExtractedTable]:
+def _add_extracted_tables(
+    extracted: List[ExtractedTable],
+    seen_hashes: set[str],
+    source: str,
+    tables: List[Tuple[int, pd.DataFrame]],
+) -> int:
+    added = 0
+    for page, df in tables:
+        if df is None or df.empty:
+            continue
+        h = hash_df(df)
+        if not h or h in seen_hashes:
+            continue
+        seen_hashes.add(h)
+        extracted.append(ExtractedTable(page=page, source=source, df=df, df_hash=h))
+        added += 1
+    return added
+
+
+def _run_table_extractor(
+    name: str,
+    pdf_path: Path,
+    pages: str,
+) -> List[Tuple[int, pd.DataFrame]]:
+    if name == "camelot_lattice":
+        return extract_with_camelot(pdf_path, pages=pages, flavor="lattice")
+    if name == "camelot_stream":
+        return extract_with_camelot(pdf_path, pages=pages, flavor="stream")
+    if name == "pdfplumber":
+        return extract_with_pdfplumber(pdf_path, pages=pages)
+    raise ValueError(f"Unsupported table extractor: {name}")
+
+
+def _sort_extracted_tables(tables: List[ExtractedTable]) -> List[ExtractedTable]:
+    tables.sort(key=lambda t: (t.page, t.source, t.df_hash))
+    return tables
+
+
+def extract_tables_fast(
+    pdf_path: Path,
+    pages: str,
+    extractors: List[str],
+) -> List[ExtractedTable]:
+    """
+    Fast path: try extractors in order and stop at the first one that yields
+    usable tables. This avoids waiting for slower fallback extractors when the
+    primary extractor already found content.
+    """
+    for source in extractors:
+        extracted: List[ExtractedTable] = []
+        seen_hashes: set[str] = set()
+        try:
+            tables = _run_table_extractor(source, pdf_path, pages)
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "PDF table extractor %s failed", source, exc_info=True
+            )
+            continue
+        if _add_extracted_tables(extracted, seen_hashes, source, tables) > 0:
+            return _sort_extracted_tables(extracted)
+    return []
+
+
+def extract_tables_quality(
+    pdf_path: Path,
+    pages: str,
+    extractors: List[str],
+) -> List[ExtractedTable]:
+    """
+    Quality path: run every enabled extractor and de-duplicate their results.
+    This preserves the previous highest-recall behavior, but it is slower.
+    """
     extracted: List[ExtractedTable] = []
     seen_hashes: set[str] = set()
+    results: dict[str, List[Tuple[int, pd.DataFrame]]] = {k: [] for k in extractors}
 
-    def add(src: str, tables: List[Tuple[int, pd.DataFrame]]):
-        nonlocal extracted, seen_hashes
-        for page, df in tables:
-            if df is None or df.empty:
-                continue
-            h = hash_df(df)
-            if not h or h in seen_hashes:
-                continue
-            seen_hashes.add(h)
-            extracted.append(ExtractedTable(page=page, source=src, df=df, df_hash=h))
-
-    extractor_order = ["camelot_lattice", "camelot_stream", "pdfplumber"]
-    run_specs = {
-        "camelot_lattice": lambda: extract_with_camelot(pdf_path, pages=pages, flavor="lattice"),
-        "camelot_stream": lambda: extract_with_camelot(pdf_path, pages=pages, flavor="stream"),
-        "pdfplumber": lambda: extract_with_pdfplumber(pdf_path, pages=pages),
-    }
-
-    results: dict[str, List[Tuple[int, pd.DataFrame]]] = {k: [] for k in extractor_order}
-    worker_count = max(1, min(EXTRACTOR_WORKERS, len(extractor_order)))
+    worker_count = max(1, min(EXTRACTOR_WORKERS, len(extractors)))
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
-        futures = {pool.submit(run_specs[name]): name for name in extractor_order}
+        futures = {
+            pool.submit(_run_table_extractor, name, pdf_path, pages): name
+            for name in extractors
+        }
         for fut in as_completed(futures):
             name = futures[fut]
             try:
                 results[name] = fut.result()
             except Exception:
+                logging.getLogger(__name__).debug(
+                    "PDF table extractor %s failed", name, exc_info=True
+                )
                 results[name] = []
 
-    for src in extractor_order:
-        add(src, results[src])
+    for src in extractors:
+        _add_extracted_tables(extracted, seen_hashes, src, results[src])
 
-    # stable ordering
-    extracted.sort(key=lambda t: (t.page, t.source, t.df_hash))
-    return extracted
+    return _sort_extracted_tables(extracted)
+
+
+def extract_tables_optimum(pdf_path: Path, pages: str = "all") -> List[ExtractedTable]:
+    strategy = PDF_TABLE_STRATEGY
+    if strategy in {"quality", "optimum", "all"}:
+        return extract_tables_quality(pdf_path, pages, PDF_TABLE_EXTRACTORS)
+    if strategy not in {"fast", "first", "sequential"}:
+        logging.getLogger(__name__).warning(
+            "Unknown PDF_TABLE_STRATEGY=%r; falling back to fast", strategy
+        )
+    return extract_tables_fast(pdf_path, pages, PDF_TABLE_EXTRACTORS)
 
 def extract_text_pypdf(pdf_path: Path, max_pages: int) -> str:
     from pypdf import PdfReader  # lazy import
