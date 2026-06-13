@@ -1,0 +1,21 @@
+[project]
+name = "api-convert2md"
+version = "2.1.0"
+description = "Token-protected FastAPI document-to-Markdown service with OpenWebUI external loader compatibility."
+requires-python = ">=3.11"
+dependencies = [
+  "aiofiles",
+  "camelot-py[cv]",
+  "fastapi",
+  "opencv-python-headless",
+  "pandas",
+  "pdfplumber",
+  "pypdf",
+  "python-multipart",
+  "requests",
+  "tabulate",
+  "uvicorn[standard]",
+]
+
+[tool.uv]
+package = false

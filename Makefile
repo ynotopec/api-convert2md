@@ -1,4 +1,7 @@
-.PHONY: run
+.PHONY: install run
+
+install:
+	./install.sh
 
 run:
-	python3 -m uvicorn app:app --host 0.0.0.0 --port 8088
+	./run.sh $${HOST:-0.0.0.0} $${PORT:-8088}
