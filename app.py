@@ -44,7 +44,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import json
+import logging
 import os
 import secrets
 import re
@@ -61,6 +63,59 @@ import aiofiles
 import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+
+
+def patch_pypdfium2_autoclose_finalizer() -> None:
+    """
+    Make pypdfium2's weakref finalizer tolerant of already-pruned children.
+
+    Some pypdfium2 releases can emit an "Exception ignored in: <finalize ...>"
+    AssertionError after Camelot/PDFium rendering has already succeeded. The
+    assertion is an internal bookkeeping check for a child weakref that may have
+    been pruned by the parent PdfDocument close path, so it creates noisy stderr
+    output even though the request completes successfully.
+    """
+    if importlib.util.find_spec("pypdfium2.internal.bases") is None:
+        return
+
+    import pypdfium2.internal.bases as pdfium_bases
+
+    if getattr(pdfium_bases, "_api_convert2md_finalizer_patched", False):
+        return
+
+    original_close_template = pdfium_bases._close_template
+
+    def tolerant_close_template(info, owner):
+        try:
+            original_close_template(info, owner)
+        except AssertionError as exc:
+            parent = owner.parent
+            if parent is None or not info.tracked:
+                raise
+
+            message = str(exc)
+            if str(owner.wref) not in message:
+                raise
+
+            pdfium_bases._debug_close(f"Close ({info.state.name.lower()}) {owner.repr}")
+            if not pdfium_bases.LIBRARY_AVAILABLE:
+                pdfium_bases._warn_close(
+                    f"-> Cannot close {owner.repr}; pdfium library is destroyed. "
+                    "This may cause a memory leak."
+                )
+                return
+
+            if info.state == pdfium_bases._STATE.INVALID or parent._tree_closed():
+                raise
+
+            logging.getLogger(__name__).debug(
+                "Ignored stale pypdfium2 child weakref while closing %s", owner.repr
+            )
+            info.close_func(owner.raw, *info.args, **info.kwargs)
+            pdfium_bases.ObjectTracker[owner.type].discard(owner.wref)
+
+    pdfium_bases._close_template = tolerant_close_template
+    pdfium_bases._api_convert2md_finalizer_patched = True
 
 
 # -----------------------------
@@ -299,6 +354,8 @@ class ExtractedTable:
     df_hash: str
 
 def extract_with_camelot(pdf_path: Path, pages: str, flavor: str) -> List[Tuple[int, pd.DataFrame]]:
+    patch_pypdfium2_autoclose_finalizer()
+
     import camelot  # lazy import
 
     kwargs = {}
