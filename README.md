@@ -74,3 +74,9 @@ For best PDF table extraction, install Ghostscript on the host:
 ```bash
 sudo apt-get install -y ghostscript
 ```
+
+## License
+
+API Convert2MD is free software licensed under the
+[GNU General Public License, version 2 only](LICENSE), the same core license
+used by the Linux kernel.
