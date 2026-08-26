@@ -2,7 +2,11 @@
 name = "api-convert2md"
 version = "2.1.0"
 description = "Token-protected FastAPI document-to-Markdown service with OpenWebUI external loader compatibility."
+license = "GPL-2.0-only"
 requires-python = ">=3.11"
+classifiers = [
+  "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+]
 dependencies = [
   "aiofiles",
   "camelot-py[cv]",
